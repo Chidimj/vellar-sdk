@@ -12,11 +12,43 @@ export interface SessionStorageAdapter {
   clear(): Promise<void>;
 }
 
+/** Current persisted-session shape. Bump when `WalletSession`'s stored shape changes incompatibly. */
+export const SESSION_SCHEMA_VERSION = 1;
+
+/**
+ * A persisted session was written by a newer SDK whose shape this version does
+ * not understand. Distinct from corruption: the stored data is intact and must
+ * not be erased, so a newer client (or a downgrade-then-upgrade) can still use it.
+ */
+export class SessionSchemaTooNewError extends Error {
+  constructor(
+    readonly found: number,
+    readonly supported: number = SESSION_SCHEMA_VERSION,
+  ) {
+    super(
+      `Stored session uses schema version ${found}, newer than the supported version ${supported}. ` +
+        "Update vellar-sdk to restore it; the stored session was left untouched.",
+    );
+    this.name = "SessionSchemaTooNewError";
+  }
+}
+
+/** Throws SessionSchemaTooNewError if `value` carries a valid but unsupported-future schemaVersion. */
+export function assertSessionSchemaSupported(value: unknown): void {
+  if (typeof value !== "object" || value === null) return;
+  const version = (value as { schemaVersion?: unknown }).schemaVersion;
+  if (typeof version === "number" && Number.isInteger(version) && version > SESSION_SCHEMA_VERSION) {
+    throw new SessionSchemaTooNewError(version);
+  }
+}
+
 export type SessionStatus = "loading" | "connected" | "disconnected";
 
 export interface SessionState {
   session: WalletSession | null;
   status: SessionStatus;
+  /** Why the last restore() left the session disconnected for a reason the app can act on (e.g. a newer schema); null otherwise. */
+  restoreError: Error | null;
   /** Begin a session (after wallet create/connect) and persist it. */
   start(session: WalletSession): Promise<void>;
   /** Update lastActiveAt on user activity and persist. No-op when disconnected. */
@@ -56,6 +88,8 @@ export function isWalletSession(value: unknown): value is WalletSession {
     (v.network === "testnet" || v.network === "mainnet") &&
     typeof v.connected === "boolean" &&
     v.authMethod === "passkey" &&
+    (v.schemaVersion === undefined ||
+      (typeof v.schemaVersion === "number" && Number.isInteger(v.schemaVersion) && v.schemaVersion >= 1)) &&
     typeof v.createdAt === "string" &&
     typeof v.lastActiveAt === "string"
   );
@@ -96,10 +130,12 @@ export function createSessionStore(
   store = createStore<SessionState>((set, get) => ({
     session: null,
     status: "loading",
+    restoreError: null,
 
     async start(session) {
-      await storage.save(session);
-      set({ session, status: "connected" });
+      const stamped: WalletSession = { ...session, schemaVersion: SESSION_SCHEMA_VERSION };
+      await storage.save(stamped);
+      set({ session: stamped, status: "connected", restoreError: null });
       // Begin periodic refresh only once connected (and only if configured).
       startRefresh();
     },
@@ -122,15 +158,23 @@ export function createSessionStore(
     async restore() {
       try {
         const stored = await storage.load();
+        // Version gate runs before the shape check so a future-schema blob is
+        // never mistaken for (or parsed as) the current shape.
+        assertSessionSchemaSupported(stored);
         if (stored && isWalletSession(stored)) {
-          set({ session: stored, status: "connected" });
+          set({ session: stored, status: "connected", restoreError: null });
           startRefresh();
         } else {
-          set({ session: null, status: "disconnected" });
+          set({ session: null, status: "disconnected", restoreError: null });
         }
-      } catch {
+      } catch (err) {
+        if (err instanceof SessionSchemaTooNewError) {
+          // Keep the newer blob in storage; just report why we are disconnected.
+          set({ session: null, status: "disconnected", restoreError: err });
+          return;
+        }
         // Unreadable storage must not brick the app on startup.
-        set({ session: null, status: "disconnected" });
+        set({ session: null, status: "disconnected", restoreError: null });
       }
     },
 
@@ -153,6 +197,7 @@ export function createWebStorageAdapter(
       const raw = storage.getItem(key);
       if (raw === null) return null;
       const parsed: unknown = JSON.parse(raw);
+      assertSessionSchemaSupported(parsed);
       return isWalletSession(parsed) ? parsed : null;
     },
     async save(session) {

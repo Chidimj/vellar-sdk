@@ -9,13 +9,15 @@ export interface PasskeyKitLike {
   createWallet(
     app: string,
     user: string,
-  ): Promise<{ keyIdBase64: string; contractId: string; signedTx: unknown }>;
+  ): Promise<{ keyIdBase64: string; contractId: string; signedTx: unknown; rpId?: string }>;
   connectWallet(opts?: {
     /** Connect a specific credential, skipping the WebAuthn discovery ceremony. */
     keyId?: string;
     getContractId?: (keyId: string) => Promise<string | undefined>;
-  }): Promise<{ keyIdBase64: string; contractId: string }>;
+  }): Promise<{ keyIdBase64: string; contractId: string; rpId?: string }>;
   sign(tx: unknown): Promise<unknown>;
+  /** WebAuthn Relying Party id the kit is bound to (PasskeyKit's `rpId`), if known. */
+  readonly rpId?: string;
   /** The connected wallet client, if any (set by createWallet/connectWallet). */
   readonly wallet?: unknown;
 }
@@ -80,6 +82,14 @@ export interface PasskeyKitConnectorOptions {
   network: Network;
   /** Shown in the platform passkey prompt (WebAuthn RP display name). */
   appName: string;
+  /**
+   * Expected WebAuthn RP ID (the domain passkeys are scoped to). When set, any
+   * ceremony or signing whose RP ID differs, or is not reported at all, is
+   * rejected with PasskeyRpIdMismatchError before it reaches signing or backend
+   * submission. See "Passkey RP ID binding" in the threat model
+   * (website/content/docs/architecture/threat-model.md).
+   */
+  rpId?: string;
   now?: () => Date;
   /** Converts kit.sign output to XDR. Default handles strings and objects with toXDR(). */
   signedToXdr?: (signed: unknown) => string;
@@ -113,6 +123,36 @@ export class WalletNetworkMismatchError extends Error {
     super(`Connector is configured for ${expected} but was asked to operate on ${actual}`);
     this.name = "WalletNetworkMismatchError";
   }
+}
+
+/** The username cannot be used as a passkey display name (contains control characters). */
+export class InvalidUsernameError extends Error {
+  constructor() {
+    super("username must not contain control characters");
+    this.name = "InvalidUsernameError";
+  }
+}
+
+/** A passkey assertion/registration was scoped to a different WebAuthn RP ID than configured. */
+export class PasskeyRpIdMismatchError extends Error {
+  constructor(expected: string, actual: string | undefined) {
+    super(
+      actual === undefined
+        ? `Passkey RP ID is configured as "${expected}" but the kit did not report one, so it cannot be verified`
+        : `Passkey RP ID mismatch: configured "${expected}" but the ceremony used "${actual}"`,
+    );
+    this.name = "PasskeyRpIdMismatchError";
+  }
+}
+
+// Control characters (Cc) plus line/paragraph separators: invalid in a WebAuthn
+// user.name and a vector for spoofing the platform prompt.
+const INVALID_USERNAME_CHARS = /[\p{Cc}\u2028\u2029]/u;
+
+function normalizeUsername(raw: string | undefined): string {
+  const trimmed = raw?.trim() ?? "";
+  if (INVALID_USERNAME_CHARS.test(trimmed)) throw new InvalidUsernameError();
+  return trimmed || "Vellar user";
 }
 
 /** A passkey (WebAuthn) ceremony was attempted outside a browser. */
@@ -158,6 +198,21 @@ export function createPasskeyKitConnector(options: PasskeyKitConnectorOptions): 
 
   function assertNetwork(requested: Network): void {
     if (requested !== network) throw new WalletNetworkMismatchError(network, requested);
+  }
+
+  // RP ID validation: with `options.rpId` set, the RP ID the kit is bound to
+  // (checked before any ceremony or signing) and the RP ID reported with a
+  // ceremony result (checked before backend submission or session creation)
+  // must both equal it. A missing report fails closed once an RP ID is
+  // configured. This stops a credential scoped to another origin from being
+  // accepted as this app's wallet (cross-origin credential confusion).
+  function assertRpId(actual: string | undefined): void {
+    if (options.rpId !== undefined && actual !== options.rpId) {
+      throw new PasskeyRpIdMismatchError(options.rpId, actual);
+    }
+  }
+  function assertKitRpId(): void {
+    if (options.rpId !== undefined && kit.rpId !== undefined) assertRpId(kit.rpId);
   }
 
   /**
@@ -220,8 +275,10 @@ export function createPasskeyKitConnector(options: PasskeyKitConnectorOptions): 
     async createWallet(input: CreateWalletInput): Promise<WalletSession> {
       assertBrowserWebAuthnContext("createWallet() (vellar.create())");
       assertNetwork(input.network);
-      const username = input.username?.trim() || "Vellar user";
-      const { keyIdBase64, contractId, signedTx } = await kit.createWallet(appName, username);
+      assertKitRpId();
+      const username = normalizeUsername(input.username);
+      const { keyIdBase64, contractId, signedTx, rpId } = await kit.createWallet(appName, username);
+      assertRpId(rpId ?? kit.rpId);
       // Backend submission must succeed before we report a wallet as created —
       // otherwise the user would hold a session for an undeployed account.
       const { sessionId } = await backend.submitWalletCreation({
@@ -236,22 +293,25 @@ export function createPasskeyKitConnector(options: PasskeyKitConnectorOptions): 
     async connectWallet(requested: Network): Promise<WalletSession> {
       assertBrowserWebAuthnContext("connectWallet() (vellar.connect())");
       assertNetwork(requested);
+      assertKitRpId();
       // The lookup that resolves the wallet also opens the server session
       // record; capture its id for device management.
       let serverSessionId: string | undefined;
-      const { contractId, keyIdBase64 } = await kit.connectWallet({
+      const { contractId, keyIdBase64, rpId } = await kit.connectWallet({
         getContractId: async (keyId) => {
           const found = await backend.lookupContractId({ keyId, network });
           serverSessionId = found?.sessionId;
           return found?.contractId;
         },
       });
+      assertRpId(rpId ?? kit.rpId);
       if (options.sessionKeyRotation) await rotateSessionKey(options.sessionKeyRotation);
       return sessionFor(contractId, keyIdBase64, serverSessionId);
     },
 
     async signTransaction(input: SignTransactionInput): Promise<SignedTransaction> {
       assertNetwork(input.network);
+      assertKitRpId();
       const signed = await kit.sign(input.xdr);
       return { signedXdr: signedToXdr(signed) };
     },

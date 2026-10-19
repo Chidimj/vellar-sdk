@@ -51,6 +51,12 @@ export interface VellarWalletConfig {
   /** Display name shown in the platform passkey prompt (WebAuthn RP name). */
   appName: string;
   /**
+   * Expected WebAuthn RP ID (the domain passkeys are scoped to). When set,
+   * ceremonies for any other RP ID are rejected with `PasskeyRpIdMismatchError`.
+   * See the threat model's "Passkey RP ID binding".
+   */
+  rpId?: string;
+  /**
    * The passkey smart-wallet engine (a `PasskeyKit` instance). Supplied by the
    * host so the SDK stays free of a hard dependency on a specific version and so
    * browser-only code is never imported during SSR.
@@ -207,6 +213,7 @@ export function createVellarWallet(config: VellarWalletConfig): VellarWallet {
     backend,
     network: config.network,
     appName: config.appName,
+    rpId: config.rpId,
     signedToXdr,
   });
 
@@ -220,6 +227,22 @@ export function createVellarWallet(config: VellarWalletConfig): VellarWallet {
   });
 
   let session: WalletSession | null = null;
+  let pending: "create" | "connect" | null = null;
+
+  // create() and connect() share one handle and one `session`; running two
+  // passkey ceremonies at once (e.g. a double-clicked button) would race to
+  // overwrite it. The second call is rejected instead of queued: a queued
+  // ceremony would prompt the user again after they already finished one.
+  async function exclusive(op: "create" | "connect", run: () => Promise<WalletSession>) {
+    if (pending) throw new WalletOperationInProgressError(op, pending);
+    pending = op;
+    try {
+      session = await run();
+      return session;
+    } finally {
+      pending = null;
+    }
+  }
 
   // Validate at construction so a missing/malformed RPC URL fails here, next to
   // the config that caused it — not later inside wallet.x402.fetch(). (The
@@ -310,17 +333,14 @@ export function createVellarWallet(config: VellarWalletConfig): VellarWallet {
       return payments;
     },
 
-    async create(input) {
-      session = await connector.createWallet({
-        network: config.network,
-        username: input?.username,
-      });
-      return session;
+    create(input) {
+      return exclusive("create", () =>
+        connector.createWallet({ network: config.network, username: input?.username }),
+      );
     },
 
-    async connect() {
-      session = await connector.connectWallet(config.network);
-      return session;
+    connect() {
+      return exclusive("connect", () => connector.connectWallet(config.network));
     },
 
     async pay({ to, amount, token }) {
@@ -336,6 +356,14 @@ export function createVellarWallet(config: VellarWalletConfig): VellarWallet {
       return prepared.confirm();
     },
   };
+}
+
+/** create()/connect() was called while another create()/connect() on the same handle was still pending. */
+export class WalletOperationInProgressError extends Error {
+  constructor(requested: "create" | "connect", inProgress: "create" | "connect") {
+    super(`Cannot ${requested}() while ${inProgress}() is still in progress on this wallet`);
+    this.name = "WalletOperationInProgressError";
+  }
 }
 
 export class WalletNotReadyError extends Error {

@@ -84,6 +84,18 @@ The same posture applies at catalog ingest, where `serviceName` must be printabl
 
 > ⚠️ **A fenced block is a convention, not enforcement.** The nonce makes the boundary unforgeable and the sanitiser removes dangerous characters, but neither can compel a model to treat the enclosed text as data rather than instructions. That is a property of the model, not of this code. What actually bounds the damage is the spend limits and, above all, the chain-enforced budget. Treat the fence as defence in depth, never as the primary control.
 
+## Passkey RP ID binding
+
+A passkey credential is scoped to a WebAuthn Relying Party ID (a domain). A credential minted for another RP ID must never be accepted as this app's wallet; otherwise a lookalike origin could feed the client an assertion it did not intend to trust (cross-origin credential confusion).
+
+`createVellarWallet({ rpId })` (and `createPasskeyKitConnector({ rpId })`) turns this check on. With it set, the passkey connector:
+
+- compares the kit's own `rpId` before any create, connect or sign, so nothing is prompted or signed against the wrong RP;
+- compares the RP ID reported with a create or connect result before the backend is asked to submit a wallet or a session is returned;
+- fails closed when the kit reports no RP ID at all, because an unverifiable ceremony is treated the same as a mismatched one.
+
+Every rejection throws `PasskeyRpIdMismatchError`. The check is opt-in: without `rpId`, the connector relies on the kit's default of the current browser origin. The chain still decides what a signature can do, so this guard narrows which credentials the client will talk to; it does not replace on-chain signer verification (see [Blast radius by key type](#blast-radius-by-key-type)).
+
 ## When it fails
 
 | Threat | Defence | Limitation |
@@ -92,6 +104,7 @@ The same posture applies at catalog ingest, where `serviceName` must be printabl
 | An agent pays the wrong recipient | The verified-only policy restricts recipients to contracts attested in the on-chain AttestationRegistry | The spending-limit policy has no opinion on the recipient (V-1). Verified means provenance, not audited or safe. Guarding the recipient is the application's responsibility |
 | Catalog URL squatting | Trust-on-first-use binds a resource URL to the payTo of its first settled payment; a different payTo is refused from the catalog | The attacker's payment still settles on-chain. On the hosted instance the first-settler race reopens after each restart, because there is no persistent disk |
 | Seller metadata injection | The nonce-bearing fence plus sanitisation in the MCP payer, and per-field ASCII sanitisation at catalog ingest | Neither can compel a model to treat fenced text as data. The real bound is the on-chain budget |
+| A passkey for a different RP ID | `rpId` binding rejects mismatched or unreported RP IDs before signing or backend submission | Opt-in; without `rpId` the kit default (browser origin) applies |
 | A compromised agent key | Policies co-sign inside `__check_auth`; `expiresAt` stops the key signing with no revoke needed; `revoke` removes it on-chain once confirmed | A key granted with no policies has nothing preventing it, which is why an unrestricted grant is not mintable. Until expiry or revocation confirms, the cap is the bound, not zero |
 
 ## Next steps

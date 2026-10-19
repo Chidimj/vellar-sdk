@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createPasskeyKitConnector,
   defaultSignedToXdr,
+  InvalidUsernameError,
   PasskeyBrowserRequiredError,
+  PasskeyRpIdMismatchError,
   resumeKitConnection,
   WalletNetworkMismatchError,
   type PasskeyKitConnectorOptions,
@@ -403,5 +405,102 @@ describe("defaultSignedToXdr", () => {
     expect(() => defaultSignedToXdr(42)).toThrow(TypeError);
     expect(() => defaultSignedToXdr(null)).toThrow(TypeError);
     expect(() => defaultSignedToXdr({})).toThrow(TypeError);
+  });
+});
+
+describe("passkey RP ID binding", () => {
+  function boundConnector(kit: PasskeyKitLike, backend = fakeBackend()) {
+    return createPasskeyKitConnector({
+      kit,
+      backend,
+      network: "testnet",
+      appName: "Vellar",
+      rpId: "app.vellar.io",
+      now: () => FIXED_NOW,
+    });
+  }
+
+  function connectResult(rpId?: string) {
+    return { keyIdBase64: "key-123", contractId: "CCONTRACT", ...(rpId && { rpId }) };
+  }
+
+  it("accepts a ceremony whose RP ID matches the configured one", async () => {
+    const kit = fakeKit({ connectWallet: vi.fn().mockResolvedValue(connectResult("app.vellar.io")) });
+    const session = await boundConnector(kit).connectWallet("testnet");
+    expect(session.accountId).toBe("CCONTRACT");
+  });
+
+  it("rejects a connect assertion for a different RP ID with PasskeyRpIdMismatchError", async () => {
+    const kit = fakeKit({ connectWallet: vi.fn().mockResolvedValue(connectResult("evil.example")) });
+    await expect(boundConnector(kit).connectWallet("testnet")).rejects.toBeInstanceOf(
+      PasskeyRpIdMismatchError,
+    );
+  });
+
+  it("rejects a create ceremony for a different RP ID before backend submission", async () => {
+    const kit = fakeKit({
+      createWallet: vi.fn().mockResolvedValue({
+        keyIdBase64: "key-123",
+        contractId: "CCONTRACT",
+        signedTx: "deploy-xdr",
+        rpId: "evil.example",
+      }),
+    });
+    const backend = fakeBackend();
+    await expect(
+      boundConnector(kit, backend).createWallet({ network: "testnet" }),
+    ).rejects.toBeInstanceOf(PasskeyRpIdMismatchError);
+    expect(backend.submitWalletCreation).not.toHaveBeenCalled();
+  });
+
+  it("rejects a kit bound to a different RP ID before any ceremony or signing", async () => {
+    const kit = fakeKit({ rpId: "evil.example" });
+    const c = boundConnector(kit);
+    await expect(c.connectWallet("testnet")).rejects.toBeInstanceOf(PasskeyRpIdMismatchError);
+    await expect(c.createWallet({ network: "testnet" })).rejects.toBeInstanceOf(
+      PasskeyRpIdMismatchError,
+    );
+    await expect(c.signTransaction({ xdr: "xdr", network: "testnet" })).rejects.toBeInstanceOf(
+      PasskeyRpIdMismatchError,
+    );
+    expect(kit.connectWallet).not.toHaveBeenCalled();
+    expect(kit.createWallet).not.toHaveBeenCalled();
+    expect(kit.sign).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when an RP ID is configured but neither kit nor result reports one", async () => {
+    await expect(boundConnector(fakeKit()).connectWallet("testnet")).rejects.toBeInstanceOf(
+      PasskeyRpIdMismatchError,
+    );
+  });
+
+  it("does not check RP ID when none is configured", async () => {
+    const kit = fakeKit({ rpId: "anything.example" });
+    await expect(connector(kit).connectWallet("testnet")).resolves.toBeDefined();
+  });
+});
+
+describe("username validation", () => {
+  it.each([["bad\u0000name"], ["line\nbreak"], ["tab\tname"], ["del\u007fname"]])(
+    "rejects control characters (%j) before invoking the kit",
+    async (username) => {
+      const kit = fakeKit();
+      await expect(
+        connector(kit).createWallet({ username, network: "testnet" }),
+      ).rejects.toBeInstanceOf(InvalidUsernameError);
+      expect(kit.createWallet).not.toHaveBeenCalled();
+    },
+  );
+
+  it("trims surrounding whitespace consistently", async () => {
+    const kit = fakeKit();
+    await connector(kit).createWallet({ username: "  alice  ", network: "testnet" });
+    expect(kit.createWallet).toHaveBeenCalledWith("Vellar", "alice");
+  });
+
+  it("treats a unicode-whitespace-only username as blank and uses the default", async () => {
+    const kit = fakeKit();
+    await connector(kit).createWallet({ username: "    ", network: "testnet" });
+    expect(kit.createWallet).toHaveBeenCalledWith("Vellar", "Vellar user");
   });
 });

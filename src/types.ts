@@ -20,9 +20,22 @@ export interface WalletSession {
    * discovery ceremony). Public data.
    */
   keyId?: string;
+  /**
+   * Persisted-shape version, stamped by `SessionState.start`. Absent on
+   * sessions saved before versioning (treated as version 1). `restore()`
+   * rejects anything newer than `SESSION_SCHEMA_VERSION` with
+   * `SessionSchemaTooNewError` instead of parsing it as the current shape.
+   */
+  schemaVersion?: number;
 }
 
 export interface CreateWalletInput {
+  /**
+   * Display name for the passkey. Surrounding whitespace (including Unicode
+   * spaces) is trimmed; missing or blank falls back to "Vellar user". Control
+   * characters (Unicode category Cc, plus U+2028/U+2029) are rejected with
+   * `InvalidUsernameError` before the passkey ceremony starts.
+   */
   username?: string;
   network: Network;
 }

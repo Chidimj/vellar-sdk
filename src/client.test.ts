@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createVellarWallet, WalletNotReadyError } from "./client";
-import { PasskeyBrowserRequiredError } from "./passkeykit-connector";
+import { createVellarWallet, WalletNotReadyError, WalletOperationInProgressError } from "./client";
+import { InvalidUsernameError, PasskeyBrowserRequiredError } from "./passkeykit-connector";
 import { X402NotConfiguredError, type SmartAccountX402Signer } from "./x402-types";
 import type { TokenInfo } from "./balances";
 
@@ -229,5 +229,96 @@ describe("circuit breaker around facilitator calls", () => {
     backend.submitTransaction.mockClear();
     await expect(wallet.pay({ to: "CDEST", amount: 1n, token })).resolves.toBeTruthy();
     expect(backend.submitTransaction).toHaveBeenCalledOnce();
+  });
+});
+
+describe("create() username validation", () => {
+  it("rejects a username with control characters before invoking passkey registration", async () => {
+    const { wallet, kit } = build();
+    await expect(wallet.create({ username: "al\u0000ice" })).rejects.toBeInstanceOf(
+      InvalidUsernameError,
+    );
+    expect(kit.createWallet).not.toHaveBeenCalled();
+    expect(wallet.session).toBeNull();
+  });
+
+  it("a whitespace-only username uses the default name and succeeds", async () => {
+    const { wallet, kit } = build();
+    const session = await wallet.create({ username: "   \t " });
+    expect(kit.createWallet).toHaveBeenCalledWith("Test App", "Vellar user");
+    expect(wallet.session).toEqual(session);
+  });
+
+  it("a valid username is passed through trimmed", async () => {
+    const { wallet, kit } = build();
+    await wallet.create({ username: " alice " });
+    expect(kit.createWallet).toHaveBeenCalledWith("Test App", "alice");
+  });
+});
+
+describe("concurrent create() and connect() on one handle", () => {
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    const promise = new Promise<T>((r) => (resolve = r));
+    return { promise, resolve };
+  }
+
+  it("rejects connect() with WalletOperationInProgressError while create() is pending", async () => {
+    const { wallet, kit } = build();
+    const gate = deferred<{ keyIdBase64: string; contractId: string; signedTx: string }>();
+    kit.createWallet.mockImplementationOnce(() => gate.promise);
+
+    const first = wallet.create({ username: "alice" });
+    await expect(wallet.connect()).rejects.toBeInstanceOf(WalletOperationInProgressError);
+    expect(kit.connectWallet).not.toHaveBeenCalled();
+
+    gate.resolve({ keyIdBase64: "key-A", contractId: "CCREATED", signedTx: "x" });
+    const session = await first;
+    expect(session.accountId).toBe("CCREATED");
+    expect(wallet.session).toEqual(session);
+  });
+
+  it("rejects a second create() while one is pending, producing exactly one session", async () => {
+    const { wallet, kit, backend } = build();
+    const gate = deferred<{ keyIdBase64: string; contractId: string; signedTx: string }>();
+    kit.createWallet.mockImplementationOnce(() => gate.promise);
+
+    const first = wallet.create();
+    await expect(wallet.create()).rejects.toBeInstanceOf(WalletOperationInProgressError);
+    gate.resolve({ keyIdBase64: "key-A", contractId: "CCREATED", signedTx: "x" });
+    await first;
+
+    expect(kit.createWallet).toHaveBeenCalledTimes(1);
+    expect(backend.submitWalletCreation).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects create() while connect() is pending and keeps the connect session", async () => {
+    const { wallet, kit } = build();
+    const gate = deferred<{ keyIdBase64: string; contractId: string }>();
+    kit.connectWallet.mockImplementationOnce(() => gate.promise);
+
+    const first = wallet.connect();
+    await expect(wallet.create()).rejects.toBeInstanceOf(WalletOperationInProgressError);
+    gate.resolve({ keyIdBase64: "key-B", contractId: "CCONNECTED" });
+    await first;
+
+    expect(wallet.session?.accountId).toBe("CCONNECTED");
+    expect(kit.createWallet).not.toHaveBeenCalled();
+  });
+
+  it("releases the guard after a failure so a retry works, leaving session untouched", async () => {
+    const { wallet, kit } = build();
+    kit.connectWallet.mockRejectedValueOnce(new Error("user cancelled"));
+    await expect(wallet.connect()).rejects.toThrow("user cancelled");
+    expect(wallet.session).toBeNull();
+
+    const session = await wallet.connect();
+    expect(wallet.session).toEqual(session);
+  });
+
+  it("allows sequential calls after the first settles", async () => {
+    const { wallet } = build();
+    await wallet.create();
+    await expect(wallet.connect()).resolves.toBeDefined();
   });
 });

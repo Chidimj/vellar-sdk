@@ -120,12 +120,14 @@ Returns a `VellarWallet`:
 | Member                       | Description                                                  |
 | ---------------------------- | ------------------------------------------------------------ |
 | `session`                    | The current `WalletSession`, or `null` before create/connect |
-| `create({ username? })`      | Register a passkey and create the smart account              |
+| `create({ username? })`      | Register a passkey and create the smart account. `username` is trimmed; blank uses "Vellar user"; control characters throw `InvalidUsernameError` |
 | `connect()`                  | Reconnect with an existing passkey                           |
 | `pay({ to, amount, token })` | Build → simulate → sign → submit; returns `{ hash }`         |
 | `policies`                   | Programmable account policies — see [Policies](#policies)   |
 | `x402`                       | Agentic payments — pay HTTP-402 resources — see [x402](#x402) |
 | `connector` / `payments`     | Lower-level building blocks for custom flows                 |
+
+**Concurrency:** `create()` and `connect()` share one handle and one `session`, so only one may be in flight at a time. A call made while the other is pending rejects immediately with `WalletOperationInProgressError` (it is not queued, so the user is never prompted twice). The pending call settles normally and `wallet.session` reflects only its outcome; a failed call leaves `session` unchanged and the handle usable again. Disable your button while the promise is pending.
 
 ### Helpers
 

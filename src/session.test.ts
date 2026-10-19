@@ -5,6 +5,8 @@ import {
   createSessionStore,
   createWebStorageAdapter,
   isWalletSession,
+  SESSION_SCHEMA_VERSION,
+  SessionSchemaTooNewError,
   type SessionStorageAdapter,
 } from "./session";
 
@@ -29,8 +31,8 @@ describe("createSessionStore", () => {
     const store = createSessionStore(storage);
     await store.getState().start(session);
     expect(store.getState().status).toBe("connected");
-    expect(store.getState().session).toEqual(session);
-    expect(await storage.load()).toEqual(session);
+    expect(store.getState().session).toEqual({ ...session, schemaVersion: SESSION_SCHEMA_VERSION });
+    expect(await storage.load()).toEqual({ ...session, schemaVersion: SESSION_SCHEMA_VERSION });
   });
 
   it("restore() resumes a persisted session", async () => {
@@ -423,5 +425,91 @@ describe("isWalletSession", () => {
     ["non-boolean connected", { ...session, connected: "yes" }],
   ])("rejects %s", (_label, value) => {
     expect(isWalletSession(value)).toBe(false);
+  });
+});
+
+describe("session schema version", () => {
+  const future = { ...session, schemaVersion: SESSION_SCHEMA_VERSION + 1 };
+
+  it("start() stamps the current schema version", async () => {
+    const storage = createMemoryStorageAdapter();
+    const store = createSessionStore(storage);
+    await store.getState().start(session);
+    expect((await storage.load())?.schemaVersion).toBe(SESSION_SCHEMA_VERSION);
+  });
+
+  it("restore() accepts a session with the current version", async () => {
+    const storage = createMemoryStorageAdapter();
+    await storage.save({ ...session, schemaVersion: SESSION_SCHEMA_VERSION });
+    const store = createSessionStore(storage);
+    await store.getState().restore();
+    expect(store.getState().status).toBe("connected");
+    expect(store.getState().restoreError).toBeNull();
+  });
+
+  it("restore() accepts an unversioned (legacy) session", async () => {
+    const storage = createMemoryStorageAdapter();
+    await storage.save(session);
+    const store = createSessionStore(storage);
+    await store.getState().restore();
+    expect(store.getState().status).toBe("connected");
+  });
+
+  it("restore() rejects a newer schema with SessionSchemaTooNewError", async () => {
+    const storage = createMemoryStorageAdapter();
+    await storage.save(future);
+    const store = createSessionStore(storage);
+    await store.getState().restore();
+    expect(store.getState().status).toBe("disconnected");
+    expect(store.getState().session).toBeNull();
+    const err = store.getState().restoreError;
+    expect(err).toBeInstanceOf(SessionSchemaTooNewError);
+    expect((err as SessionSchemaTooNewError).found).toBe(SESSION_SCHEMA_VERSION + 1);
+  });
+
+  it("does not parse a future blob as the current shape, even if its shape differs", async () => {
+    const adapter = createWebStorageAdapter({
+      getItem: () => JSON.stringify({ schemaVersion: 99, account: { id: "C1" } }),
+      setItem: vi.fn(),
+      removeItem: vi.fn(),
+    });
+    const store = createSessionStore(adapter);
+    await store.getState().restore();
+    expect(store.getState().restoreError).toBeInstanceOf(SessionSchemaTooNewError);
+  });
+
+  it("does not erase the newer blob from storage", async () => {
+    const removeItem = vi.fn();
+    const store = createSessionStore(
+      createWebStorageAdapter({
+        getItem: () => JSON.stringify(future),
+        setItem: vi.fn(),
+        removeItem,
+      }),
+    );
+    await store.getState().restore();
+    expect(removeItem).not.toHaveBeenCalled();
+  });
+
+  it("a corrupted blob stays a plain disconnect with no schema error", async () => {
+    const store = createSessionStore(
+      createWebStorageAdapter({
+        getItem: () => "{not json",
+        setItem: vi.fn(),
+        removeItem: vi.fn(),
+      }),
+    );
+    await store.getState().restore();
+    expect(store.getState().status).toBe("disconnected");
+    expect(store.getState().restoreError).toBeNull();
+  });
+
+  it("treats a non-integer schemaVersion as corrupted, not future", async () => {
+    const storage = createMemoryStorageAdapter();
+    await storage.save({ ...session, schemaVersion: "2" } as never);
+    const store = createSessionStore(storage);
+    await store.getState().restore();
+    expect(store.getState().status).toBe("disconnected");
+    expect(store.getState().restoreError).toBeNull();
   });
 });
